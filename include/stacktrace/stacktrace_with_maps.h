@@ -2,7 +2,6 @@
 
 #include <cxxabi.h>
 #include <execinfo.h>
-#include <libgen.h>
 #include <sys/wait.h>
 
 #include <array>
@@ -20,7 +19,11 @@
 #include <utility>
 #include <vector>
 
-namespace ust {
+// copy from https://github.com/MisterTea/UniversalStacktrace
+namespace stacktrace {
+
+namespace internal {
+
 template <typename Out>
 inline void split(const std::string &s, char delim, Out result) {
   std::stringstream ss;
@@ -56,15 +59,12 @@ inline std::string SystemToStr(const char *cmd) {
   return result;
 }
 
-inline char *ustBasename(char *path) { return ::basename(path); }
-
 inline std::string addressToString(uint64_t address) {
   std::ostringstream ss;
   ss << "0x" << std::hex << uint64_t(address);
   return ss.str();
 }
 
-static const int MAX_STACK_FRAMES = 64;
 class StackTraceEntry {
  public:
   StackTraceEntry(int _stackIndex, std::string _address,
@@ -94,19 +94,21 @@ inline std::ostream &operator<<(std::ostream &ss, const StackTraceEntry &si) {
   }
   if (si.lineNumber > 0) {
     std::string sourceFileNameCopy = si.sourceFileName;
-    ss << " (" << ustBasename(&sourceFileNameCopy[0]) << ":" << si.lineNumber
+    ss << " (" << basename(&sourceFileNameCopy[0]) << ":" << si.lineNumber
        << ")";
   }
   return ss;
 }
 
+}  // namespace internal
+
 class StackTrace {
  public:
-  explicit StackTrace(std::vector<StackTraceEntry> _entries)
+  explicit StackTrace(std::vector<internal::StackTraceEntry> _entries)
       : entries(std::move(_entries)) {}
   friend std::ostream &operator<<(std::ostream &ss, const StackTrace &si);
 
-  std::vector<StackTraceEntry> entries;
+  std::vector<internal::StackTraceEntry> entries;
 };
 
 inline std::ostream &operator<<(std::ostream &ss, const StackTrace &si) {
@@ -116,20 +118,10 @@ inline std::ostream &operator<<(std::ostream &ss, const StackTrace &si) {
   return ss;
 }
 
-// Non-visual studio compilers use a mess of things:
-// Apple uses backtrace() + atos
-// Linux uses backtrace() + addr2line
-// MinGW uses CaptureStackBackTrace() + addr2line
-inline StackTrace generate() {
-  // Libunwind and some other functions aren't thread safe.
-  static std::mutex mtx;
-  std::lock_guard<std::mutex> lock(mtx);
-
-  std::vector<StackTraceEntry> stackTrace;
+std::map<std::string, std::pair<uint64_t, uint64_t> > GetAddressMaps() {
   std::map<std::string, std::pair<uint64_t, uint64_t> > addressMaps;
   std::string line;
-  std::string procMapFileName = std::string("/proc/self/maps");
-  std::ifstream infile(procMapFileName.c_str());
+  std::ifstream infile("/proc/self/maps");
   // Some OSes don't have /proc/*/maps, so we won't have base addresses for them
   while (std::getline(infile, line)) {
     std::istringstream iss(line);
@@ -143,8 +135,10 @@ inline StackTrace generate() {
     if (!(iss >> addressRange >> perms >> offset >> device >> inode >> path)) {
       break;
     }  // error
-    uint64_t startAddress = stoull(split(addressRange, '-')[0], nullptr, 16);
-    uint64_t endAddress = stoull(split(addressRange, '-')[1], nullptr, 16);
+    uint64_t startAddress =
+        stoull(internal::split(addressRange, '-')[0], nullptr, 16);
+    uint64_t endAddress =
+        stoull(internal::split(addressRange, '-')[1], nullptr, 16);
     if (addressMaps.find(path) == addressMaps.end()) {
       addressMaps[path] = std::make_pair(startAddress, endAddress);
     } else {
@@ -152,14 +146,25 @@ inline StackTrace generate() {
       addressMaps[path].second = std::max(addressMaps[path].second, endAddress);
     }
   }
+  return addressMaps;
+}
+
+// Linux uses backtrace() + addr2line
+static const int MAX_STACK_FRAMES = 64;
+inline StackTrace generate() {
+  // Libunwind and some other functions aren't thread safe.
+  static std::mutex mtx;
+  static auto addressMaps = GetAddressMaps();
+
+  std::lock_guard<std::mutex> lock(mtx);
 
   void *stack[MAX_STACK_FRAMES];
-  int numFrames;
-  numFrames = backtrace(stack, MAX_STACK_FRAMES);
+  int numFrames = backtrace(stack, MAX_STACK_FRAMES);
   memmove(stack, stack + 1, sizeof(void *) * (numFrames - 1));
   numFrames--;
 
   char **strings = backtrace_symbols(stack, numFrames);
+  std::vector<internal::StackTraceEntry> stackTrace;
   if (strings) {
     for (int a = 0; a < numFrames; ++a) {
       std::string addr;
@@ -168,7 +173,8 @@ inline StackTrace generate() {
 
       const std::string line(strings[a]);
 
-      // Example: ./ust-test(_ZNK5Catch21TestInvokerAsFunction6invokeEv+0x16)
+      // Example:
+      // ./stacktrace-test(_ZNK5Catch21TestInvokerAsFunction6invokeEv+0x16)
       // [0x55f1278af96e]
       auto parenStart = line.find('(');
       auto parenEnd = line.find(')');
@@ -182,10 +188,10 @@ inline StackTrace generate() {
       functionName = functionName.substr(0, functionName.find('+'));
       if (addressMaps.find(fileName) != addressMaps.end()) {
         // Make address relative to process start
-        addr =
-            addressToString(uint64_t(stack[a]) - addressMaps[fileName].first);
+        addr = internal::addressToString(uint64_t(stack[a]) -
+                                         addressMaps[fileName].first);
       } else {
-        addr = addressToString(uint64_t(stack[a]));
+        addr = internal::addressToString(uint64_t(stack[a]));
       }
 
       // Perform demangling if parsed properly
@@ -203,7 +209,7 @@ inline StackTrace generate() {
           free(demangledFunctionName);
         }
       }
-      StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
+      internal::StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
       stackTrace.push_back(entry);
     }
     free(strings);
@@ -228,9 +234,9 @@ inline StackTrace generate() {
     for (const auto &it2 : it.second) {
       ss << it2 << " ";
     }
-    auto addrLineOutput = SystemToStr(ss.str().c_str());
+    auto addrLineOutput = internal::SystemToStr(ss.str().c_str());
     if (addrLineOutput.length()) {
-      auto outputLines = split(addrLineOutput, '\n');
+      auto outputLines = internal::split(addrLineOutput, '\n');
       fileData[fileName] =
           std::list<std::string>(outputLines.begin(), outputLines.end());
     }
@@ -254,5 +260,6 @@ inline StackTrace generate() {
   }
 
   return StackTrace(stackTrace);
-}  // namespace ust
-}  // namespace ust
+}
+
+}  // namespace stacktrace
