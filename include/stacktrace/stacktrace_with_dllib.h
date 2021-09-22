@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cxxabi.h>
+#include <dlfcn.h>
 #include <execinfo.h>
 #include <sys/wait.h>
 
@@ -20,7 +21,7 @@
 #include <vector>
 
 // copy from https://github.com/MisterTea/UniversalStacktrace
-namespace stacktrace {
+namespace stacktrace_dl {
 
 namespace internal {
 
@@ -118,44 +119,11 @@ inline std::ostream &operator<<(std::ostream &ss, const StackTrace &si) {
   return ss;
 }
 
-std::map<std::string, std::pair<uint64_t, uint64_t> > GetAddressMaps() {
-  std::map<std::string, std::pair<uint64_t, uint64_t> > addressMaps;
-  std::string line;
-  std::ifstream infile("/proc/self/maps");
-  // Some OSes don't have /proc/*/maps, so we won't have base addresses for them
-  while (std::getline(infile, line)) {
-    std::istringstream iss(line);
-    std::string addressRange;
-    std::string perms;
-    std::string offset;
-    std::string device;
-    std::string inode;
-    std::string path;
-
-    if (!(iss >> addressRange >> perms >> offset >> device >> inode >> path)) {
-      break;
-    }  // error
-    uint64_t startAddress =
-        stoull(internal::split(addressRange, '-')[0], nullptr, 16);
-    uint64_t endAddress =
-        stoull(internal::split(addressRange, '-')[1], nullptr, 16);
-    if (addressMaps.find(path) == addressMaps.end()) {
-      addressMaps[path] = std::make_pair(startAddress, endAddress);
-    } else {
-      addressMaps[path].first = std::min(addressMaps[path].first, startAddress);
-      addressMaps[path].second = std::max(addressMaps[path].second, endAddress);
-    }
-  }
-  return addressMaps;
-}
-
 // Linux uses backtrace() + addr2line
 static const int MAX_STACK_FRAMES = 64;
 inline StackTrace generate() {
   // Libunwind and some other functions aren't thread safe.
   static std::mutex mtx;
-
-  auto addressMaps = GetAddressMaps();
 
   std::lock_guard<std::mutex> lock(mtx);
 
@@ -164,60 +132,49 @@ inline StackTrace generate() {
   memmove(stack, stack + 1, sizeof(void *) * (numFrames - 1));
   numFrames--;
 
-  char **strings = backtrace_symbols(stack, numFrames);
   std::vector<internal::StackTraceEntry> stackTrace;
-  if (strings) {
-    for (int a = 0; a < numFrames; ++a) {
-      std::string addr;
-      std::string fileName;
-      std::string functionName;
+  for (int a = 0; a < numFrames; ++a) {
+    std::string addr;
+    std::string fileName;
+    std::string functionName;
 
-      const std::string line(strings[a]);
-
-      // Example:
-      // ./stacktrace-test(_ZNK5Catch21TestInvokerAsFunction6invokeEv+0x16)
-      // [0x55f1278af96e]
-      auto parenStart = line.find('(');
-      auto parenEnd = line.find(')');
-      fileName = line.substr(0, parenStart);
+    Dl_info dl_info;
+    // On success, dladdr() return a nonzero value.
+    if (0 != dladdr(stack[a], &dl_info)) {
+      // Make address relative to process start
+      addr = internal::addressToString(uint64_t(stack[a]) -
+                                       (uint64_t)dl_info.dli_fbase);
       // Convert filename to canonical path
-      char buf[PATH_MAX];
-      ::realpath(fileName.c_str(), buf);
-      fileName = std::string(buf);
-      functionName = line.substr(parenStart + 1, parenEnd - (parenStart + 1));
-      // Strip off the offset from the name
-      functionName = functionName.substr(0, functionName.find('+'));
-      if (addressMaps.find(fileName) != addressMaps.end()) {
-        // Make address relative to process start
-        addr = internal::addressToString(uint64_t(stack[a]) -
-                                         addressMaps[fileName].first);
-      } else {
-        addr = internal::addressToString(uint64_t(stack[a]));
+      if (dl_info.dli_fname) {
+        char *buf = ::realpath(dl_info.dli_fname, nullptr);
+        fileName = buf ? buf : "";
+        free(buf);
       }
-
-      // Perform demangling if parsed properly
-      if (!functionName.empty()) {
-        int status = 0;
-        auto demangledFunctionName =
-            abi::__cxa_demangle(functionName.data(), nullptr, nullptr, &status);
-        // if demangling is successful, output the demangled function name
-        if (status == 0) {
-          // Success (see
-          // http://gcc.gnu.org/onlinedocs/libstdc++/libstdc++-html-USERS-4.3/a01696.html)
-          functionName = std::string(demangledFunctionName);
-        }
-        if (demangledFunctionName) {
-          free(demangledFunctionName);
-        }
-      }
-      internal::StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
-      stackTrace.push_back(entry);
+      functionName = dl_info.dli_sname ? dl_info.dli_sname : "";
+    } else {
+      addr = internal::addressToString(uint64_t(stack[a]));
     }
-    free(strings);
+
+    // Perform demangling if parsed properly
+    if (!functionName.empty()) {
+      int status = 0;
+      auto demangledFunctionName =
+          abi::__cxa_demangle(functionName.data(), nullptr, nullptr, &status);
+      // if demangling is successful, output the demangled function name
+      if (status == 0) {
+        // Success (see
+        // http://gcc.gnu.org/onlinedocs/libstdc++/libstdc++-html-USERS-4.3/a01696.html)
+        functionName = std::string(demangledFunctionName);
+      }
+      if (demangledFunctionName) {
+        free(demangledFunctionName);
+      }
+    }
+    internal::StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
+    stackTrace.push_back(entry);
   }
 
   // Fetch source file & line numbers
-  // Unix & MinGW
   std::map<std::string, std::list<std::string> > fileAddresses;
   std::map<std::string, std::list<std::string> > fileData;
   for (const auto &it : stackTrace) {
@@ -263,4 +220,4 @@ inline StackTrace generate() {
   return StackTrace(stackTrace);
 }
 
-}  // namespace stacktrace
+}  // namespace stacktrace_dl
