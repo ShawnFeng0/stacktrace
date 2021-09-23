@@ -5,10 +5,8 @@
 #include <cstdlib>
 
 #include "stacktrace/stacktrace_with_dllib.h"
-#include "stacktrace/stacktrace_with_maps.h"
 
 static void func2(void) {
-  std::cout << stacktrace::generate();
   std::cout << stacktrace_dl::generate();
 }
 
