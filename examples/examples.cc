@@ -7,7 +7,7 @@
 #include "stacktrace/stacktrace_with_dllib.h"
 
 static void func2(void) {
-  std::cout << stacktrace_dl::generate();
+  std::cout << stacktrace_dl::generate().to_string();
 }
 
 void func1(int ncalls) {

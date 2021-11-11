@@ -3,6 +3,7 @@
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <link.h>
 #include <sys/wait.h>
 
 #include <array>
@@ -66,58 +67,57 @@ inline std::string addressToString(uint64_t address) {
   return ss.str();
 }
 
-class StackTraceEntry {
- public:
+struct StackTraceEntry {
   StackTraceEntry(int _stackIndex, std::string _address,
                   std::string _binaryFileName, std::string _functionName,
                   std::string _sourceFileName, int _lineNumber)
-      : stackIndex(_stackIndex),
+      : stack_index(_stackIndex),
         address(std::move(_address)),
-        binaryFileName(std::move(_binaryFileName)),
-        functionName(std::move(_functionName)),
-        sourceFileName(std::move(_sourceFileName)),
-        lineNumber(_lineNumber) {}
+        binary_file_name(std::move(_binaryFileName)),
+        function_name(std::move(_functionName)),
+        source_file_name(std::move(_sourceFileName)),
+        line_number(_lineNumber) {}
 
-  int stackIndex;
+  inline std::string to_string() const {
+    std::string str;
+    str += "#" + std::to_string(stack_index) + " " + address;
+    if (!function_name.empty()) {
+      str += " " + function_name;
+    }
+    if (line_number > 0) {
+      std::string sourceFileNameCopy = source_file_name;
+      str += " (" + std::string(basename(&sourceFileNameCopy[0])) + ":" +
+             std::to_string(line_number) + ")";
+    }
+    return str;
+  }
+
+  int stack_index;
   std::string address;
-  std::string binaryFileName;
-  std::string functionName;
-  std::string sourceFileName;
-  int lineNumber;
-
-  friend std::ostream &operator<<(std::ostream &ss, const StackTraceEntry &si);
+  std::string binary_file_name;
+  std::string function_name;
+  std::string source_file_name;
+  int line_number;
 };
-
-inline std::ostream &operator<<(std::ostream &ss, const StackTraceEntry &si) {
-  ss << "#" << si.stackIndex << " " << si.address;
-  if (!si.functionName.empty()) {
-    ss << " " << si.functionName;
-  }
-  if (si.lineNumber > 0) {
-    std::string sourceFileNameCopy = si.sourceFileName;
-    ss << " (" << basename(&sourceFileNameCopy[0]) << ":" << si.lineNumber
-       << ")";
-  }
-  return ss;
-}
 
 }  // namespace internal
 
 class StackTrace {
  public:
   explicit StackTrace(std::vector<internal::StackTraceEntry> _entries)
-      : entries(std::move(_entries)) {}
-  friend std::ostream &operator<<(std::ostream &ss, const StackTrace &si);
+      : entries_(std::move(_entries)) {}
 
-  std::vector<internal::StackTraceEntry> entries;
-};
-
-inline std::ostream &operator<<(std::ostream &ss, const StackTrace &si) {
-  for (const auto &it : si.entries) {
-    ss << it << "\n";
+  inline std::string to_string() {
+    std::string str;
+    for (const auto &it : entries_) {
+      str += it.to_string() + "\n";
+    }
+    return str;
   }
-  return ss;
-}
+
+ private:
+  std::vector<internal::StackTraceEntry> entries_;
+};
 
 // Linux uses backtrace() + addr2line
 static const int MAX_STACK_FRAMES = 64;
@@ -139,17 +139,26 @@ inline StackTrace generate() {
     std::string functionName;
 
     Dl_info dl_info;
+    struct link_map *map{};
+
     // On success, dladdr() return a nonzero value.
-    if (0 != dladdr(stack[a], &dl_info)) {
-      // Make address relative to process start
-      addr = internal::addressToString(uint64_t(stack[a]) -
-                                       (uint64_t)dl_info.dli_fbase);
+    if (0 != dladdr1(stack[a], &dl_info, reinterpret_cast<void **>(&map),
+                     RTLD_DL_LINKMAP)) {
       // Convert filename to canonical path
-      if (dl_info.dli_fname) {
+      if (dl_info.dli_fname && dl_info.dli_fname[0] != '\0') {
         char *buf = ::realpath(dl_info.dli_fname, nullptr);
         fileName = buf ? buf : "";
         free(buf);
+
+        // ref:
+        // https://code.woboq.org/userspace/glibc/debug/backtracesyms.c.html
+        // glibc/debug/backtracesyms.c::62
+        dl_info.dli_fbase = reinterpret_cast<void *>(map->l_addr);
       }
+
+      // Make address relative to process start
+      addr = internal::addressToString(uint64_t(stack[a]) -
+                                       (uint64_t)dl_info.dli_fbase);
       functionName = dl_info.dli_sname ? dl_info.dli_sname : "";
     } else {
       addr = internal::addressToString(uint64_t(stack[a]));
@@ -178,11 +187,11 @@ inline StackTrace generate() {
   std::map<std::string, std::list<std::string> > fileAddresses;
   std::map<std::string, std::list<std::string> > fileData;
   for (const auto &it : stackTrace) {
-    if (it.binaryFileName.length()) {
-      if (fileAddresses.find(it.binaryFileName) == fileAddresses.end()) {
-        fileAddresses[it.binaryFileName] = {};
+    if (it.binary_file_name.length()) {
+      if (fileAddresses.find(it.binary_file_name) == fileAddresses.end()) {
+        fileAddresses[it.binary_file_name] = {};
       }
-      fileAddresses.at(it.binaryFileName).push_back(it.address);
+      fileAddresses.at(it.binary_file_name).push_back(it.address);
     }
   }
   for (const auto &it : fileAddresses) {
@@ -201,18 +210,18 @@ inline StackTrace generate() {
   }
   std::regex addrToLineRegex("^(.+?) at (.+):([0-9]+)");
   for (auto &it : stackTrace) {
-    if (it.binaryFileName.length() &&
-        fileData.find(it.binaryFileName) != fileData.end()) {
-      std::string outputLine = fileData.at(it.binaryFileName).front();
-      fileData.at(it.binaryFileName).pop_front();
+    if (it.binary_file_name.length() &&
+        fileData.find(it.binary_file_name) != fileData.end()) {
+      std::string outputLine = fileData.at(it.binary_file_name).front();
+      fileData.at(it.binary_file_name).pop_front();
       if (outputLine == std::string("?? ??:0")) {
         continue;
       }
       std::smatch matches;
       if (regex_search(outputLine, matches, addrToLineRegex)) {
-        it.functionName = matches[1];
-        it.sourceFileName = matches[2];
-        it.lineNumber = std::stoi(matches[3]);
+        it.function_name = matches[1];
+        it.source_file_name = matches[2];
+        it.line_number = std::stoi(matches[3]);
       }
     }
   }
