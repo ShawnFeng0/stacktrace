@@ -27,7 +27,7 @@ namespace stacktrace_dl {
 namespace internal {
 
 template <typename Out>
-inline void split(const std::string &s, char delim, Out result) {
+inline void Split(const std::string &s, char delim, Out result) {
   std::stringstream ss;
   ss.str(s);
   std::string item;
@@ -36,9 +36,9 @@ inline void split(const std::string &s, char delim, Out result) {
   }
 }
 
-inline std::vector<std::string> split(const std::string &s, char delim) {
+inline std::vector<std::string> Split(const std::string &s, char delim) {
   std::vector<std::string> elems;
-  split(s, delim, std::back_inserter(elems));
+  Split(s, delim, std::back_inserter(elems));
   return elems;
 }
 
@@ -61,7 +61,7 @@ inline std::string SystemToStr(const char *cmd) {
   return result;
 }
 
-inline std::string addressToString(uint64_t address) {
+inline std::string address2string(uint64_t address) {
   std::ostringstream ss;
   ss << "0x" << std::hex << uint64_t(address);
   return ss.str();
@@ -80,13 +80,12 @@ struct StackTraceEntry {
 
   inline std::string to_string() const {
     std::string str;
-    str += "#" + std::to_string(stack_index) + " " + address;
-    if (!function_name.empty()) {
-      str += " " + function_name;
-    }
+    str += "#" + std::to_string(stack_index);
+    str += " " + std::string(basename(binary_file_name.c_str())) + "(+" +
+           address + ")";
+    str += " " + function_name;
     if (line_number > 0) {
-      std::string sourceFileNameCopy = source_file_name;
-      str += " (" + std::string(basename(&sourceFileNameCopy[0])) + ":" +
+      str += " (" + std::string(basename(source_file_name.c_str())) + ":" +
              std::to_string(line_number) + ")";
     }
     return str;
@@ -120,26 +119,28 @@ class StackTrace {
 };
 
 // Linux uses backtrace() + addr2line
-static const int MAX_STACK_FRAMES = 64;
-inline StackTrace generate() {
+inline StackTrace Generate() {
   // Libunwind and some other functions aren't thread safe.
   static std::mutex mtx;
+  static constexpr int MAX_STACK_FRAMES = 64;
 
   std::lock_guard<std::mutex> lock(mtx);
 
-  void *stack[MAX_STACK_FRAMES];
-  int numFrames = backtrace(stack, MAX_STACK_FRAMES);
-  memmove(stack, stack + 1, sizeof(void *) * (numFrames - 1));
-  numFrames--;
+  void *stack_raw[MAX_STACK_FRAMES];
+  int num_frames = backtrace(stack_raw, MAX_STACK_FRAMES);
 
-  std::vector<internal::StackTraceEntry> stackTrace;
-  for (int a = 0; a < numFrames; ++a) {
+  // Discard the current stack frame
+  void **stack = &stack_raw[1];
+  num_frames -= 1;
+
+  std::vector<internal::StackTraceEntry> stack_trace;
+  for (int a = 0; a < num_frames; ++a) {
     std::string addr;
-    std::string fileName;
-    std::string functionName;
+    std::string file_name;
+    std::string function_name;
 
     Dl_info dl_info;
-    struct link_map *map{};
+    struct link_map *map;
 
     // On success, dladdr() return a nonzero value.
     if (0 != dladdr1(stack[a], &dl_info, reinterpret_cast<void **>(&map),
@@ -147,7 +148,7 @@ inline StackTrace generate() {
       // Convert filename to canonical path
       if (dl_info.dli_fname && dl_info.dli_fname[0] != '\0') {
         char *buf = ::realpath(dl_info.dli_fname, nullptr);
-        fileName = buf ? buf : "";
+        file_name = buf ? buf : "";
         free(buf);
 
         // ref:
@@ -157,44 +158,44 @@ inline StackTrace generate() {
       }
 
       // Make address relative to process start
-      addr = internal::addressToString(uint64_t(stack[a]) -
-                                       (uint64_t)dl_info.dli_fbase);
-      functionName = dl_info.dli_sname ? dl_info.dli_sname : "";
+      addr = internal::address2string(uint64_t(stack[a]) -
+                                      (uint64_t)dl_info.dli_fbase);
+      function_name = dl_info.dli_sname ? dl_info.dli_sname : "";
     } else {
-      addr = internal::addressToString(uint64_t(stack[a]));
+      addr = internal::address2string(uint64_t(stack[a]));
     }
 
     // Perform demangling if parsed properly
-    if (!functionName.empty()) {
+    if (!function_name.empty()) {
       int status = 0;
-      auto demangledFunctionName =
-          abi::__cxa_demangle(functionName.data(), nullptr, nullptr, &status);
+      auto demangled_function_name =
+          abi::__cxa_demangle(function_name.data(), nullptr, nullptr, &status);
       // if demangling is successful, output the demangled function name
       if (status == 0) {
         // Success (see
         // http://gcc.gnu.org/onlinedocs/libstdc++/libstdc++-html-USERS-4.3/a01696.html)
-        functionName = std::string(demangledFunctionName);
+        function_name = std::string(demangled_function_name);
       }
-      if (demangledFunctionName) {
-        free(demangledFunctionName);
+      if (demangled_function_name) {
+        free(demangled_function_name);
       }
     }
-    internal::StackTraceEntry entry(a, addr, fileName, functionName, "", -1);
-    stackTrace.push_back(entry);
+    internal::StackTraceEntry entry(a, addr, file_name, function_name, "", -1);
+    stack_trace.push_back(entry);
   }
 
   // Fetch source file & line numbers
-  std::map<std::string, std::list<std::string> > fileAddresses;
-  std::map<std::string, std::list<std::string> > fileData;
-  for (const auto &it : stackTrace) {
+  std::map<std::string, std::list<std::string> > file_addresses;
+  std::map<std::string, std::list<std::string> > file_data;
+  for (const auto &it : stack_trace) {
     if (it.binary_file_name.length()) {
-      if (fileAddresses.find(it.binary_file_name) == fileAddresses.end()) {
-        fileAddresses[it.binary_file_name] = {};
+      if (file_addresses.find(it.binary_file_name) == file_addresses.end()) {
+        file_addresses[it.binary_file_name] = {};
       }
-      fileAddresses.at(it.binary_file_name).push_back(it.address);
+      file_addresses.at(it.binary_file_name).push_back(it.address);
     }
   }
-  for (const auto &it : fileAddresses) {
+  for (const auto &it : file_addresses) {
     std::string fileName = it.first;
     std::ostringstream ss;
     ss << "addr2line -C -f -p -e " << fileName << " ";
@@ -203,22 +204,22 @@ inline StackTrace generate() {
     }
     auto addrLineOutput = internal::SystemToStr(ss.str().c_str());
     if (addrLineOutput.length()) {
-      auto outputLines = internal::split(addrLineOutput, '\n');
-      fileData[fileName] =
+      auto outputLines = internal::Split(addrLineOutput, '\n');
+      file_data[fileName] =
           std::list<std::string>(outputLines.begin(), outputLines.end());
     }
   }
-  std::regex addrToLineRegex("^(.+?) at (.+):([0-9]+)");
-  for (auto &it : stackTrace) {
+  std::regex addr_to_line_regex("^(.+?) at (.+):([0-9]+)");
+  for (auto &it : stack_trace) {
     if (it.binary_file_name.length() &&
-        fileData.find(it.binary_file_name) != fileData.end()) {
-      std::string outputLine = fileData.at(it.binary_file_name).front();
-      fileData.at(it.binary_file_name).pop_front();
-      if (outputLine == std::string("?? ??:0")) {
+        file_data.find(it.binary_file_name) != file_data.end()) {
+      std::string output_line = file_data.at(it.binary_file_name).front();
+      file_data.at(it.binary_file_name).pop_front();
+      if (output_line == std::string("?? ??:0")) {
         continue;
       }
       std::smatch matches;
-      if (regex_search(outputLine, matches, addrToLineRegex)) {
+      if (regex_search(output_line, matches, addr_to_line_regex)) {
         it.function_name = matches[1];
         it.source_file_name = matches[2];
         it.line_number = std::stoi(matches[3]);
@@ -226,7 +227,7 @@ inline StackTrace generate() {
     }
   }
 
-  return StackTrace(stackTrace);
+  return StackTrace(stack_trace);
 }
 
 }  // namespace stacktrace_dl
