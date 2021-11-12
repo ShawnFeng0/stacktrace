@@ -10,7 +10,7 @@
 #include "stacktrace/stacktrace_with_dllib.h"
 
 static void exit_handle(int32_t signal_num) {
-  std::cout << "handle signal:" << signal_num << std::endl;
+  std::cout << "handle signal:" << strsignal(signal_num) << std::endl;
   std::cout << stacktrace_dl::Generate().to_string();
   exit(-1);
 }
