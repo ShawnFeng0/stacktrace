@@ -4,19 +4,17 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <link.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <climits>
-#include <cstdio>
-#include <fstream>
-#include <iostream>
 #include <list>
 #include <map>
 #include <mutex>
 #include <regex>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,8 +24,16 @@ namespace stacktrace_dl {
 
 namespace internal {
 
+static inline long get_thread_id() { return syscall(SYS_gettid); }
+
+static inline std::string get_thread_name() {
+  char name[16];
+  prctl(PR_GET_NAME, name);
+  return {name};
+}
+
 template <typename Out>
-inline void Split(const std::string &s, char delim, Out result) {
+static inline void Split(const std::string &s, char delim, Out result) {
   std::stringstream ss;
   ss.str(s);
   std::string item;
@@ -43,10 +49,10 @@ inline std::vector<std::string> Split(const std::string &s, char delim) {
 }
 
 // Needed for calling addr2line / atos
-inline std::string SystemToStr(const char *cmd) {
+inline std::string SystemToStr(const std::string &cmd) {
   std::array<char, 128> buffer{};
   std::string result;
-  FILE *pipe = popen(cmd, "r");
+  FILE *pipe = popen(cmd.c_str(), "r");
   if (!pipe) {
     throw std::runtime_error("popen() failed!");
   }
@@ -108,6 +114,9 @@ class StackTrace {
 
   inline std::string to_string() {
     std::string str;
+    str += "Thread id: " + std::to_string(internal::get_thread_id());
+    str += " name: " + internal::get_thread_name();
+    str += "\n";
     for (const auto &it : entries_) {
       str += it.to_string() + "\n";
     }
