@@ -202,7 +202,9 @@ inline StackTrace Generate() {
     for (const auto &it2 : it.second) {
       ss << it2 << " ";
     }
-    auto addrLineOutput = internal::SystemToStr(ss.str().c_str());
+    ss << " 2>/dev/null"; // Turn off error output
+
+    auto addrLineOutput = internal::SystemToStr(ss.str());
     if (addrLineOutput.length()) {
       auto outputLines = internal::Split(addrLineOutput, '\n');
       file_data[fileName] =
