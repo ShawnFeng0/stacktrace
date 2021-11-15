@@ -156,9 +156,7 @@ inline StackTrace Generate() {
                      RTLD_DL_LINKMAP)) {
       // Convert filename to canonical path
       if (dl_info.dli_fname && dl_info.dli_fname[0] != '\0') {
-        char *buf = ::realpath(dl_info.dli_fname, nullptr);
-        file_name = buf ? buf : "";
-        free(buf);
+        file_name = dl_info.dli_fname;
 
         // ref:
         // https://code.woboq.org/userspace/glibc/debug/backtracesyms.c.html
